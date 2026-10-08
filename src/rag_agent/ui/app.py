@@ -8,26 +8,28 @@ Three-panel layout:
   - Centre: Document viewer
   - Right: Chat interface
 
-API contract with the backend (agree this with Pipeline Engineer
-before building anything):
+Workshop flow (Markdown-only demo):
+  1. Upload one or more .md notes in the sidebar and click "Ingest Documents"
+  2. Chunks are embedded locally (all-MiniLM-L6-v2) and stored in ChromaDB
+  3. Ask a question in the chat — the most relevant chunks are retrieved
+     and passed to the Groq LLM, which answers only from that context
 
-  ingest(file_paths: list[Path]) -> IngestionResult
-  list_documents() -> list[dict]
-  get_document_chunks(source: str) -> list[DocumentChunk]
-  chat(query: str, history: list[dict], filters: dict) -> AgentResponse
+Run with: uv run streamlit run src/rag_agent/ui/app.py
 
 PEP 8 | OOP | Single Responsibility
 """
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import streamlit as st
+from langchain_core.messages import HumanMessage, SystemMessage
 
-from rag_agent.agent.graph import get_compiled_graph
-from rag_agent.agent.state import AgentResponse
-from rag_agent.config import get_settings
+from rag_agent.agent.prompts import NO_CONTEXT_RESPONSE, SYSTEM_PROMPT
+from rag_agent.agent.state import AgentResponse, RetrievedChunk
+from rag_agent.config import LLMFactory, get_settings
 from rag_agent.corpus.chunker import DocumentChunker
 from rag_agent.vectorstore.store import VectorStoreManager
 
@@ -40,7 +42,7 @@ from rag_agent.vectorstore.store import VectorStoreManager
 # ChromaDB and reloading the embedding model on every button click.
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Loading embedding model and ChromaDB...")
 def get_vector_store() -> VectorStoreManager:
     """
     Return the singleton VectorStoreManager.
@@ -58,9 +60,13 @@ def get_chunker() -> DocumentChunker:
 
 
 @st.cache_resource
-def get_graph():
-    """Return the compiled LangGraph agent."""
-    return get_compiled_graph()
+def get_llm():
+    """
+    Return the cached chat model (Groq by default, set in .env).
+
+    Cached so the LLM client is created once, not on every rerun.
+    """
+    return LLMFactory().create()
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +90,7 @@ def initialise_session_state() -> None:
         "ingested_documents": [],     # list of dicts from list_documents()
         "selected_document": None,    # source filename currently in viewer
         "last_ingestion_result": None,
-        "thread_id": "default-session",  # LangGraph conversation thread
+        "thread_id": "default-session",
         "topic_filter": None,
         "difficulty_filter": None,
     }
@@ -105,9 +111,9 @@ def render_ingestion_panel(
     """
     Render the document ingestion panel in the sidebar.
 
-    Allows multi-file upload of PDF and Markdown files. Displays
-    ingestion results (chunks added, duplicates skipped, errors).
-    Updates the ingested documents list after successful ingestion.
+    Allows multi-file upload of Markdown files. Displays ingestion
+    results (chunks added, duplicates skipped, errors) and the list
+    of documents currently stored in ChromaDB.
 
     Parameters
     ----------
@@ -116,28 +122,70 @@ def render_ingestion_panel(
     """
     st.sidebar.header("📂 Corpus Ingestion")
 
-    # TODO: implement
-    # 1. st.sidebar.file_uploader(
-    #        "Upload study materials",
-    #        type=["pdf", "md"],
-    #        accept_multiple_files=True
-    #    )
-    #
-    # 2. "Ingest Documents" button — only enabled when files are selected
-    #
-    # 3. On button click:
-    #    a. Save uploaded files to a temp directory
-    #    b. chunker.chunk_files(file_paths)
-    #    c. store.ingest(chunks) → IngestionResult
-    #    d. Display result: st.success / st.warning / st.error
-    #       Show: "{result.ingested} chunks added, {result.skipped} duplicates skipped"
-    #    e. Refresh ingested documents list in session_state
-    #
-    # 4. Render ingested documents list below the uploader
-    #    For each document: show source name, topic, chunk count
-    #    Add a small "🗑 Remove" button per document that calls store.delete_document()
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload Markdown notes",
+        type=["md", "markdown"],
+        accept_multiple_files=True,
+    )
 
-    st.sidebar.info("Upload .pdf or .md files to populate the corpus.")
+    if st.sidebar.button(
+        "Ingest Documents", disabled=not uploaded_files
+    ):
+        all_chunks = []
+        file_errors: list[str] = []
+
+        with st.spinner("Chunking and embedding documents..."):
+            # Save uploads to a temp folder, keeping the original filenames
+            # so the filename-based metadata (topic_difficulty.md) still works.
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                for uploaded in uploaded_files:
+                    file_path = Path(tmp_dir) / Path(uploaded.name).name
+                    file_path.write_bytes(uploaded.getvalue())
+                    try:
+                        all_chunks.extend(chunker.chunk_file(file_path))
+                    except Exception as exc:
+                        file_errors.append(f"{uploaded.name}: {exc}")
+
+            result = store.ingest(all_chunks)
+
+        result.errors.extend(file_errors)
+        st.session_state.last_ingestion_result = result
+        st.session_state.ingested_documents = store.list_documents()
+
+    # Show the result of the most recent ingestion
+    result = st.session_state.last_ingestion_result
+    if result is not None:
+        summary = (
+            f"{result.ingested} chunks added, "
+            f"{result.skipped} duplicates skipped"
+        )
+        if result.errors:
+            st.sidebar.error(summary + "\n\n" + "\n".join(result.errors))
+        elif result.ingested > 0:
+            st.sidebar.success(summary)
+        else:
+            st.sidebar.warning(summary)
+
+    # List of documents currently in ChromaDB
+    documents = store.list_documents()
+    st.session_state.ingested_documents = documents
+
+    st.sidebar.subheader("Ingested documents")
+    if not documents:
+        st.sidebar.info("Upload .md files to populate the corpus.")
+        return
+
+    for doc in documents:
+        col_name, col_btn = st.sidebar.columns([4, 1])
+        col_name.caption(
+            f"**{doc['source']}**  \n{doc['topic']} · {doc['chunk_count']} chunks"
+        )
+        if col_btn.button("🗑", key=f"remove_{doc['source']}", help="Remove"):
+            store.delete_document(doc["source"])
+            st.session_state.last_ingestion_result = None
+            if st.session_state.selected_document == doc["source"]:
+                st.session_state.selected_document = None
+            st.rerun()
 
 
 def render_corpus_stats(store: VectorStoreManager) -> None:
@@ -145,21 +193,19 @@ def render_corpus_stats(store: VectorStoreManager) -> None:
     Render a compact corpus health summary in the sidebar.
 
     Shows total chunks, topics covered, and whether bonus topics
-    are present. Used during Hour 3 to demonstrate corpus completeness.
+    are present.
 
     Parameters
     ----------
     store : VectorStoreManager
     """
-    # TODO: implement
-    # stats = store.get_collection_stats()
-    # st.sidebar.metric("Total Chunks", stats["total_chunks"])
-    # st.sidebar.write("Topics:", ", ".join(stats["topics"]))
-    # if stats["bonus_topics_present"]:
-    #     st.sidebar.success("✅ Bonus topics present")
-    # else:
-    #     st.sidebar.warning("⚠️ No bonus topics yet")
-    pass
+    stats = store.get_collection_stats()
+    st.sidebar.divider()
+    st.sidebar.metric("ChromaDB chunk count", stats["total_chunks"])
+    if stats["topics"]:
+        st.sidebar.write("Topics:", ", ".join(stats["topics"]))
+    if stats["bonus_topics_present"]:
+        st.sidebar.success("✅ Bonus topics present")
 
 
 # ---------------------------------------------------------------------------
@@ -180,23 +226,88 @@ def render_document_viewer(store: VectorStoreManager) -> None:
     """
     st.subheader("📄 Document Viewer")
 
-    # TODO: implement
-    # 1. If no documents ingested: show placeholder message
-    #
-    # 2. st.selectbox("Select document", options=[doc["source"] for doc in docs])
-    #    Store selection in st.session_state["selected_document"]
-    #
-    # 3. On selection change: store.get_document_chunks(selected_source)
-    #
-    # 4. Render chunks in a scrollable container (st.container with fixed height)
-    #    For each chunk:
-    #    - Show metadata badge: topic | difficulty | type
-    #    - Show chunk text
-    #    - Show similarity score if this chunk was used in last response
-    #
-    # 5. Display chunk count and coverage summary below viewer
+    documents = st.session_state.ingested_documents
+    if not documents:
+        st.info("Ingest documents using the sidebar to view content here.")
+        return
 
-    st.info("Ingest documents using the sidebar to view content here.")
+    sources = [doc["source"] for doc in documents]
+    current = st.session_state.selected_document
+    index = sources.index(current) if current in sources else 0
+
+    selected = st.selectbox("Select document", options=sources, index=index)
+    st.session_state.selected_document = selected
+
+    chunks = store.get_document_chunks(selected)
+    with st.container(height=500):
+        for i, chunk in enumerate(chunks, start=1):
+            meta = chunk.metadata
+            st.caption(
+                f"Chunk {i} · {meta.topic} | {meta.difficulty} | {meta.type}"
+            )
+            st.markdown(chunk.chunk_text)
+            st.divider()
+
+    st.caption(f"{len(chunks)} chunks in {selected}")
+
+
+# ---------------------------------------------------------------------------
+# RAG Question Answering
+# ---------------------------------------------------------------------------
+
+
+def answer_question(
+    query: str,
+    store: VectorStoreManager,
+    topic_filter: str | None = None,
+    difficulty_filter: str | None = None,
+) -> AgentResponse:
+    """
+    Retrieve relevant chunks and ask the LLM to answer from them only.
+
+    Returns NO_CONTEXT_RESPONSE (hallucination guard) when no chunk
+    passes the similarity threshold.
+    """
+    chunks: list[RetrievedChunk] = store.query(
+        query,
+        topic_filter=topic_filter,
+        difficulty_filter=difficulty_filter,
+    )
+
+    if not chunks:
+        return AgentResponse(answer=NO_CONTEXT_RESPONSE, no_context_found=True)
+
+    context = "\n\n---\n\n".join(
+        f"[SOURCE: {c.metadata.topic} | {c.metadata.source}] "
+        f"(difficulty: {c.metadata.difficulty})\n{c.chunk_text}"
+        for c in chunks
+    )
+
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(
+            content=(
+                f"CONTEXT:\n{context}\n\n"
+                f"QUESTION: {query}\n\n"
+                "Answer the question using only the context above and cite "
+                "the sources you used."
+            )
+        ),
+    ]
+
+    response = get_llm().invoke(messages)
+
+    sources: list[str] = []
+    for c in chunks:
+        citation = f"{c.to_citation()} — similarity {c.score:.2f}"
+        if citation not in sources:
+            sources.append(citation)
+
+    return AgentResponse(
+        answer=str(response.content),
+        sources=sources,
+        confidence=sum(c.score for c in chunks) / len(chunks),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -204,61 +315,79 @@ def render_document_viewer(store: VectorStoreManager) -> None:
 # ---------------------------------------------------------------------------
 
 
-def render_chat_interface(graph) -> None:
+def render_chat_interface(store: VectorStoreManager) -> None:
     """
     Render the chat interface in the right column.
 
-    Supports multi-turn conversation with the LangGraph agent.
-    Displays source citations with every response.
-    Shows a clear "no relevant context" indicator when the
-    hallucination guard fires.
+    Displays source citations with every response and a clear
+    "no relevant context" indicator when the hallucination guard fires.
 
     Parameters
     ----------
-    graph : CompiledStateGraph
-        The compiled LangGraph agent from get_compiled_graph().
+    store : VectorStoreManager
     """
-    st.subheader("💬 Interview Prep Chat")
+    st.subheader("💬 RAG Question & Answer")
 
     # Filters
+    stats = store.get_collection_stats()
     col_topic, col_diff = st.columns(2)
     with col_topic:
-        # TODO: st.selectbox for topic filter
-        pass
+        topic = st.selectbox("Topic filter", ["All"] + stats["topics"])
+        st.session_state.topic_filter = None if topic == "All" else topic
     with col_diff:
-        # TODO: st.selectbox for difficulty filter
-        pass
+        difficulty = st.selectbox(
+            "Difficulty filter", ["All", "beginner", "intermediate", "advanced"]
+        )
+        st.session_state.difficulty_filter = (
+            None if difficulty == "All" else difficulty
+        )
 
     # Chat history display
-    chat_container = st.container(height=400)
+    chat_container = st.container(height=450)
     with chat_container:
         for message in st.session_state.chat_history:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
                 if message.get("sources"):
-                    with st.expander("📎 Sources"):
+                    with st.expander("📎 Sources", expanded=True):
                         for source in message["sources"]:
                             st.caption(source)
                 if message.get("no_context_found"):
                     st.warning("⚠️ No relevant content found in corpus.")
 
     # Chat input
-    # TODO: implement
-    # 1. query = st.chat_input("Ask about a deep learning topic...")
-    #
-    # 2. On submit:
-    #    a. Append user message to chat_history
-    #    b. Display user message immediately (st.rerun or direct render)
-    #    c. Build LangGraph input:
-    #       {"messages": [HumanMessage(content=query)]}
-    #    d. config = {"configurable": {"thread_id": st.session_state.thread_id}}
-    #    e. result = graph.invoke(input, config=config)
-    #    f. response = result["final_response"]
-    #    g. Append assistant message with answer, sources, no_context_found flag
-    #
-    # STRETCH GOAL — streaming:
-    # Replace graph.invoke with graph.stream() and use st.write_stream()
-    # to display tokens as they arrive. Significant "wow factor" in Hour 3.
+    query = st.chat_input("Ask a question about your notes...")
+    if not query:
+        return
+
+    st.session_state.chat_history.append({"role": "user", "content": query})
+
+    with chat_container:
+        with st.chat_message("user"):
+            st.markdown(query)
+        with st.chat_message("assistant"):
+            with st.spinner("Retrieving context and generating answer..."):
+                try:
+                    response = answer_question(
+                        query,
+                        store,
+                        topic_filter=st.session_state.topic_filter,
+                        difficulty_filter=st.session_state.difficulty_filter,
+                    )
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": response.answer,
+                        "sources": response.sources,
+                        "no_context_found": response.no_context_found,
+                    }
+                except Exception as exc:
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": f"❌ Error while generating the answer: {exc}",
+                    }
+
+    st.session_state.chat_history.append(assistant_message)
+    st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +415,7 @@ def main() -> None:
 
     st.title(f"🧠 {settings.app_title}")
     st.caption(
-        "RAG-powered interview preparation — built with LangChain, LangGraph, and ChromaDB"
+        "RAG-powered interview preparation — built with LangChain, ChromaDB and Groq"
     )
 
     initialise_session_state()
@@ -294,7 +423,6 @@ def main() -> None:
     # Instantiate shared backend resources
     store = get_vector_store()
     chunker = get_chunker()
-    graph = get_graph()
 
     # Sidebar
     render_ingestion_panel(store, chunker)
@@ -307,7 +435,7 @@ def main() -> None:
         render_document_viewer(store)
 
     with chat_col:
-        render_chat_interface(graph)
+        render_chat_interface(store)
 
 
 if __name__ == "__main__":
